@@ -2,50 +2,61 @@
 const express = require("express");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
+const jwt = require("jsonwebtoken");
+
 const db = require("../config/database");
-const authMiddleware = require('../middleware/authMiddleware');
+const authMiddleware = require("../middleware/authMiddleware");
 
 const router = express.Router();
 
+// ==========================================
 // POST: User Registration
+// ==========================================
 router.post("/register", async (req, res) => {
-  const { full_name, email, mobile, password } = req.body;
+  const { full_name, email, mobile, password } = req.body || {};
 
-  // Validate required fields
-  if (!full_name || !email || !mobile || !password) {
+  if (
+    typeof full_name !== "string" ||
+    typeof email !== "string" ||
+    typeof mobile !== "string" ||
+    typeof password !== "string" ||
+    !full_name.trim() ||
+    !email.trim() ||
+    !mobile.trim() ||
+    !password
+  ) {
     return res.status(400).json({
       success: false,
       message: "All fields are required."
     });
   }
 
-  if (typeof password !== "string" || password.length < 8) {
+  if (password.length < 8) {
     return res.status(400).json({
       success: false,
       message: "Password must be at least 8 characters."
     });
   }
 
-  if (
-    typeof full_name !== "string" ||
-    typeof email !== "string" ||
-    typeof mobile !== "string"
-  ) {
-    return res.status(400).json({
-      success: false,
-      message: "Invalid registration information."
-    });
-  }
-
   const normalizedEmail = email.trim().toLowerCase();
   const normalizedMobile = mobile.trim();
 
-  const connection = await db.getConnection();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({
+      success: false,
+      message: "Please enter a valid email address."
+    });
+  }
+
+  let connection;
+  let transactionStarted = false;
 
   try {
-    await connection.beginTransaction();
+    connection = await db.getConnection();
 
-    // Check existing email or mobile
+    await connection.beginTransaction();
+    transactionStarted = true;
+
     const [existingUsers] = await connection.execute(
       `SELECT id FROM users
        WHERE email = ? OR mobile = ?
@@ -55,6 +66,7 @@ router.post("/register", async (req, res) => {
 
     if (existingUsers.length > 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return res.status(409).json({
         success: false,
@@ -62,10 +74,8 @@ router.post("/register", async (req, res) => {
       });
     }
 
-    // Hash password
     const passwordHash = await bcrypt.hash(password, 12);
 
-    // Create USER account
     const [userResult] = await connection.execute(
       `INSERT INTO users
        (full_name, email, mobile, password_hash, role, account_status)
@@ -78,13 +88,9 @@ router.post("/register", async (req, res) => {
       ]
     );
 
-    // Generate 6-digit OTP
     const otp = crypto.randomInt(100000, 1000000).toString();
-
-    // Hash OTP
     const otpHash = await bcrypt.hash(otp, 10);
 
-    // Save OTP with 5-minute expiry
     await connection.execute(
       `INSERT INTO otp_verifications
        (user_id, destination, purpose, otp_hash, expires_at)
@@ -93,25 +99,28 @@ router.post("/register", async (req, res) => {
     );
 
     await connection.commit();
+    transactionStarted = false;
 
-    // Registration response
     const response = {
       success: true,
-      message: "Registration successful. Email verification is pending."
+      message: "Registration successful. Please verify your email."
     };
 
-    // Show OTP only in development mode
-    console.log("CURRENT NODE ENV:", process.env.NODE_ENV);
     if (process.env.NODE_ENV === "development") {
       response.developmentOTP = otp;
-
       console.log("WorkWay Development OTP:", otp);
     }
 
     return res.status(201).json(response);
 
   } catch (error) {
-    await connection.rollback();
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Registration rollback error:", rollbackError.message);
+      }
+    }
 
     console.error("Registration error:", error.message);
 
@@ -121,11 +130,14 @@ router.post("/register", async (req, res) => {
     });
 
   } finally {
-    connection.release();
+    if (connection) connection.release();
   }
 });
 
+
+// ==========================================
 // POST: User Login
+// ==========================================
 router.post("/login", async (req, res) => {
   const { email, password } = req.body || {};
 
@@ -141,17 +153,19 @@ router.post("/login", async (req, res) => {
     });
   }
 
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    return res.status(500).json({
+      success: false,
+      message: "Authentication is not configured."
+    });
+  }
+
   const normalizedEmail = email.trim().toLowerCase();
+
   let connection;
+  let transactionStarted = false;
 
   try {
-    if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-      return res.status(500).json({
-        success: false,
-        message: "Authentication is not configured."
-      });
-    }
-
     connection = await db.getConnection();
 
     const [users] = await connection.execute(
@@ -192,23 +206,24 @@ router.post("/login", async (req, res) => {
       });
     }
 
-    if (user.account_status === "PENDING") {
+    if (user.account_status === "SUSPENDED") {
       return res.status(403).json({
         success: false,
-        code: "ACCOUNT_PENDING",
-        message: "Your account is awaiting admin approval."
+        code: "ACCOUNT_SUSPENDED",
+        message: "Your account has been suspended."
       });
     }
 
-    if (user.account_status !== "ACTIVE") {
+    if (
+      user.account_status === "DELETED" ||
+      user.account_status !== "ACTIVE"
+    ) {
       return res.status(403).json({
         success: false,
-        message: "This account is not currently active."
+        code: "ACCOUNT_NOT_ACTIVE",
+        message: "Your account is not currently active."
       });
     }
-
-    const crypto = require("crypto");
-    const jwt = require("jsonwebtoken");
 
     const sessionId = crypto.randomUUID();
 
@@ -236,6 +251,7 @@ router.post("/login", async (req, res) => {
     );
 
     await connection.beginTransaction();
+    transactionStarted = true;
 
     await connection.execute(
       `INSERT INTO user_sessions
@@ -253,11 +269,14 @@ router.post("/login", async (req, res) => {
     );
 
     await connection.execute(
-      "UPDATE users SET last_login_at = NOW() WHERE id = ?",
+      `UPDATE users
+       SET last_login_at = NOW()
+       WHERE id = ?`,
       [user.id]
     );
 
     await connection.commit();
+    transactionStarted = false;
 
     return res.status(200).json({
       success: true,
@@ -274,10 +293,12 @@ router.post("/login", async (req, res) => {
     });
 
   } catch (error) {
-    if (connection) {
+    if (connection && transactionStarted) {
       try {
         await connection.rollback();
-      } catch (_) {}
+      } catch (rollbackError) {
+        console.error("Login rollback error:", rollbackError.message);
+      }
     }
 
     console.error("Login error:", error.message);
@@ -291,31 +312,101 @@ router.post("/login", async (req, res) => {
     if (connection) connection.release();
   }
 });
-// Protected Profile Route
-router.get('/profile', authMiddleware, async (req, res) => {
-    try {
-        const [users] = await db.query(
-            'SELECT id, full_name, email, mobile, role, account_status FROM users WHERE id = ?',
-            [req.user.id]
-        );
 
-        if (users.length === 0) {
-            return res.status(404).json({
-                success: false,
-                message: 'User not found.'
-            });
-        }
 
-        res.json({
-            success: true,
-            user: users[0]
-        });
+// ==========================================
+// POST: User Logout
+// ==========================================
+router.post("/logout", authMiddleware, async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token = authHeader.slice(7).trim();
 
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            message: 'Server error.'
-        });
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const [result] = await db.execute(
+      `UPDATE user_sessions
+       SET revoked_at = NOW()
+       WHERE token_hash = ?
+         AND user_id = ?
+         AND revoked_at IS NULL`,
+      [tokenHash, req.user.id]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(401).json({
+        success: false,
+        message: "Session already logged out or invalid."
+      });
     }
+
+    return res.status(200).json({
+      success: true,
+      message: "Logout successful."
+    });
+
+  } catch (error) {
+    console.error("Logout error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Logout failed. Please try again."
+    });
+  }
 });
+
+
+// ==========================================
+// GET: Protected User Profile
+// ==========================================
+router.get("/profile", authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.sub || req.user.id;
+
+    if (!userId) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid authentication token."
+      });
+    }
+
+    const [users] = await db.execute(
+      `SELECT id, full_name, email, mobile, role, account_status
+       FROM users
+       WHERE id = ? AND deleted_at IS NULL`,
+      [userId]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found."
+      });
+    }
+
+    if (users[0].account_status !== "ACTIVE") {
+      return res.status(403).json({
+        success: false,
+        message: "This account is not currently active."
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      user: users[0]
+    });
+
+  } catch (error) {
+    console.error("Profile error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to load profile."
+    });
+  }
+});
+
 module.exports = router;

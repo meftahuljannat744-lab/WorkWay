@@ -23,20 +23,32 @@ router.post("/verify-email", async (req, res) => {
     });
   }
 
-  const connection = await db.getConnection();
+  let connection;
+  let transactionStarted = false;
 
   try {
-    await connection.beginTransaction();
-
     const normalizedEmail = email.trim().toLowerCase();
 
+    connection = await db.getConnection();
+
+    await connection.beginTransaction();
+    transactionStarted = true;
+
     const [otpRows] = await connection.execute(
-      `SELECT id, user_id, otp_hash, attempts, expires_at
-       FROM otp_verifications
-       WHERE destination = ?
-         AND purpose = 'VERIFY_EMAIL'
-         AND verified_at IS NULL
-       ORDER BY created_at DESC, id DESC
+      `SELECT
+         ov.id,
+         ov.user_id,
+         ov.otp_hash,
+         ov.attempts,
+         ov.expires_at,
+         u.account_status,
+         u.email_verified_at
+       FROM otp_verifications ov
+       LEFT JOIN users u ON u.id = ov.user_id
+       WHERE ov.destination = ?
+         AND ov.purpose = 'VERIFY_EMAIL'
+         AND ov.verified_at IS NULL
+       ORDER BY ov.created_at DESC, ov.id DESC
        LIMIT 1
        FOR UPDATE`,
       [normalizedEmail]
@@ -44,17 +56,53 @@ router.post("/verify-email", async (req, res) => {
 
     if (otpRows.length === 0) {
       await connection.rollback();
+      transactionStarted = false;
 
       return res.status(400).json({
         success: false,
-        message: "No pending OTP found. Please register again or request a new OTP."
+        message: "No pending OTP found. Please request a new OTP."
       });
     }
 
     const otpRecord = otpRows[0];
 
+    if (!otpRecord.user_id || !otpRecord.account_status) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(404).json({
+        success: false,
+        message: "Associated user account was not found."
+      });
+    }
+
+    if (
+      otpRecord.account_status === "SUSPENDED" ||
+      otpRecord.account_status === "DELETED"
+    ) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(403).json({
+        success: false,
+        message: "This account is not allowed to be activated."
+      });
+    }
+
+    if (otpRecord.account_status === "ACTIVE" &&
+        otpRecord.email_verified_at) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(200).json({
+        success: true,
+        message: "Email is already verified. You can log in."
+      });
+    }
+
     if (otpRecord.attempts >= 5) {
       await connection.rollback();
+      transactionStarted = false;
 
       return res.status(429).json({
         success: false,
@@ -64,6 +112,7 @@ router.post("/verify-email", async (req, res) => {
 
     if (new Date(otpRecord.expires_at).getTime() <= Date.now()) {
       await connection.rollback();
+      transactionStarted = false;
 
       return res.status(400).json({
         success: false,
@@ -85,6 +134,7 @@ router.post("/verify-email", async (req, res) => {
       );
 
       await connection.commit();
+      transactionStarted = false;
 
       return res.status(400).json({
         success: false,
@@ -92,6 +142,7 @@ router.post("/verify-email", async (req, res) => {
       });
     }
 
+    // Mark OTP as verified
     await connection.execute(
       `UPDATE otp_verifications
        SET verified_at = NOW()
@@ -99,22 +150,35 @@ router.post("/verify-email", async (req, res) => {
       [otpRecord.id]
     );
 
+    // Verify email and activate pending account
     await connection.execute(
       `UPDATE users
-       SET email_verified_at = NOW()
+       SET
+         email_verified_at = COALESCE(email_verified_at, NOW()),
+         account_status = CASE
+           WHEN account_status = 'PENDING' THEN 'ACTIVE'
+           ELSE account_status
+         END
        WHERE id = ?`,
       [otpRecord.user_id]
     );
 
     await connection.commit();
+    transactionStarted = false;
 
     return res.status(200).json({
       success: true,
-      message: "Email verified successfully. Your account is awaiting admin approval."
+      message: "Email verified successfully. Your account is now active. You can log in."
     });
 
   } catch (error) {
-    await connection.rollback();
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Transaction rollback error:", rollbackError.message);
+      }
+    }
 
     console.error("OTP verification error:", error.message);
 
@@ -124,7 +188,9 @@ router.post("/verify-email", async (req, res) => {
     });
 
   } finally {
-    connection.release();
+    if (connection) {
+      connection.release();
+    }
   }
 });
 
