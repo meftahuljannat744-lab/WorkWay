@@ -25,7 +25,10 @@ const authMiddleware = async (req, res, next) => {
         }
 
         // Verify JWT
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+       const decoded = jwt.verify(token, process.env.JWT_SECRET, {
+    issuer: "workway-api",
+    audience: "workway-client"
+            });
 
         if (!decoded.sub) {
             return res.status(401).json({
