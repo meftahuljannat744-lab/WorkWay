@@ -6,6 +6,8 @@ const jwt = require("jsonwebtoken");
 
 const db = require("../config/database");
 const authMiddleware = require("../middleware/authMiddleware");
+const { sendVerificationOtp } = require("../config/emailService");
+const { loginLimiter } = require("../middleware/rateLimit");
 
 const router = express.Router();
 
@@ -98,20 +100,26 @@ router.post("/register", async (req, res) => {
       [userResult.insertId, normalizedEmail, otpHash]
     );
 
-    await connection.commit();
-    transactionStarted = false;
+    
+await connection.commit();
+transactionStarted = false;
 
-    const response = {
-      success: true,
-      message: "Registration successful. Please verify your email."
-    };
+try {
+  await sendVerificationOtp(normalizedEmail, otp);
+} catch (emailError) {
+  console.error("Registration OTP email error:", emailError.message);
 
-    if (process.env.NODE_ENV === "development") {
-      response.developmentOTP = otp;
-      console.log("WorkWay Development OTP:", otp);
-    }
+  return res.status(503).json({
+    success: false,
+    message: "Registration completed, but OTP email could not be sent. Please request a new OTP."
+  });
+}
 
-    return res.status(201).json(response);
+return res.status(201).json({
+  success: true,
+  message: "Registration successful. Please check your email for the verification OTP."
+});
+
 
   } catch (error) {
     if (connection && transactionStarted) {
@@ -138,7 +146,7 @@ router.post("/register", async (req, res) => {
 // ==========================================
 // POST: User Login
 // ==========================================
-router.post("/login", async (req, res) => {
+router.post("/login", loginLimiter, async (req, res) => {
   const { email, password } = req.body || {};
 
   if (
@@ -360,7 +368,7 @@ router.post("/logout", authMiddleware, async (req, res) => {
 
 
 // ==========================================
-// GET: Protected User Profile
+// GET: Protected User Profilec
 // ==========================================
 router.get("/profile", authMiddleware, async (req, res) => {
   try {

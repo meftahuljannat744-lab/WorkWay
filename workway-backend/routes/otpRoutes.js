@@ -1,22 +1,35 @@
 
 const express = require("express");
 const bcrypt = require("bcrypt");
+const crypto = require("crypto");
+
 const db = require("../config/database");
+const { sendVerificationOtp } = require("../config/emailService");
+const { otpLimiter } = require("../middleware/rateLimit");
 
 const router = express.Router();
 
 // POST: Verify Email OTP
-router.post("/verify-email", async (req, res) => {
-  const { email, otp } = req.body;
+router.post("/verify-email", otpLimiter, async (req, res) => {
+  const { email, otp } = req.body || {};
 
-  if (!email || !otp) {
+  if (typeof email !== "string" || !email.trim()) {
     return res.status(400).json({
       success: false,
-      message: "Email and OTP are required."
+      message: "A valid email address is required."
     });
   }
 
-  if (!/^\d{6}$/.test(String(otp))) {
+  const normalizedEmail = email.trim().toLowerCase();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({
+      success: false,
+      message: "Please enter a valid email address."
+    });
+  }
+
+  if (typeof otp !== "string" || !/^\d{6}$/.test(otp)) {
     return res.status(400).json({
       success: false,
       message: "OTP must be 6 digits."
@@ -27,8 +40,6 @@ router.post("/verify-email", async (req, res) => {
   let transactionStarted = false;
 
   try {
-    const normalizedEmail = email.trim().toLowerCase();
-
     connection = await db.getConnection();
 
     await connection.beginTransaction();
@@ -89,8 +100,10 @@ router.post("/verify-email", async (req, res) => {
       });
     }
 
-    if (otpRecord.account_status === "ACTIVE" &&
-        otpRecord.email_verified_at) {
+    if (
+      otpRecord.account_status === "ACTIVE" &&
+      otpRecord.email_verified_at
+    ) {
       await connection.rollback();
       transactionStarted = false;
 
@@ -121,7 +134,7 @@ router.post("/verify-email", async (req, res) => {
     }
 
     const isValidOtp = await bcrypt.compare(
-      String(otp),
+      otp,
       otpRecord.otp_hash
     );
 
@@ -191,6 +204,130 @@ router.post("/verify-email", async (req, res) => {
     if (connection) {
       connection.release();
     }
+  }
+});
+
+
+
+// POST: Resend Email OTP
+router.post("/resend", otpLimiter, async (req, res) => {
+  const { email } = req.body || {};
+
+  if (typeof email !== "string" || !email.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: "A valid email address is required."
+    });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+    return res.status(400).json({
+      success: false,
+      message: "Please enter a valid email address."
+    });
+  }
+
+  let connection;
+  let transactionStarted = false;
+
+  try {
+    connection = await db.getConnection();
+
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    const [users] = await connection.execute(
+      `SELECT id, account_status, email_verified_at
+       FROM users
+       WHERE email = ?
+         AND deleted_at IS NULL
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedEmail]
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(404).json({
+        success: false,
+        message: "Unable to process OTP request."
+      });
+    }
+
+    const user = users[0];
+
+    if (
+      user.account_status !== "PENDING" ||
+      user.email_verified_at
+    ) {
+      await connection.rollback();
+      transactionStarted = false;
+
+      return res.status(400).json({
+        success: false,
+        message: "This account does not require email verification."
+      });
+    }
+
+    const otp = crypto.randomInt(100000, 1000000).toString();
+    const otpHash = await bcrypt.hash(otp, 10);
+
+    await connection.execute(
+      `UPDATE otp_verifications
+       SET verified_at = NOW()
+       WHERE user_id = ?
+         AND purpose = 'VERIFY_EMAIL'
+         AND verified_at IS NULL`,
+      [user.id]
+    );
+
+    await connection.execute(
+      `INSERT INTO otp_verifications
+       (user_id, destination, purpose, otp_hash, expires_at)
+       VALUES (?, ?, 'VERIFY_EMAIL', ?, DATE_ADD(NOW(), INTERVAL 5 MINUTE))`,
+      [user.id, normalizedEmail, otpHash]
+    );
+
+    await connection.commit();
+    transactionStarted = false;
+try {
+  await sendVerificationOtp(normalizedEmail, otp);
+} catch (emailError) {
+  console.error("Resend OTP email error:", emailError.message);
+
+  return res.status(503).json({
+    success: false,
+    message: "OTP could not be sent to your email. Please try again."
+  });
+}
+
+return res.status(200).json({
+  success: true,
+  message: "A new OTP has been sent to your email."
+});
+
+  } catch (error) {
+    if (connection && transactionStarted) {
+      try {
+        await connection.rollback();
+      } catch (rollbackError) {
+        console.error("Resend OTP rollback error:", rollbackError.message);
+      }
+    }
+
+    console.error("Resend OTP error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to resend OTP. Please try again."
+    });
+
+  } finally {
+    if (connection) connection.release();
   }
 });
 
