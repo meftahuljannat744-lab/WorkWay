@@ -27,4 +27,21 @@ const sendVerificationOtp = async (email, otp) => {
   });
 };
 
-module.exports = { sendVerificationOtp };
+const sendPasswordResetLink = async (email, resetUrl) => {
+  return transporter.sendMail({
+    from: `"WorkWay" <${process.env.EMAIL_USER}>`,
+    to: email,
+    subject: "WorkWay - Reset your password",
+    text: `Use this link to reset your WorkWay password. It expires in 30 minutes: ${resetUrl}\nIf you did not request this, you can ignore this email.`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 500px; margin: auto;">
+        <h2 style="color: #8B6248;">Reset your WorkWay password</h2>
+        <p>This link expires in 30 minutes.</p>
+        <p><a href="${resetUrl}">Choose a new password</a></p>
+        <p>If you did not request this, you can ignore this email.</p>
+      </div>
+    `
+  });
+};
+
+module.exports = { sendVerificationOtp, sendPasswordResetLink };

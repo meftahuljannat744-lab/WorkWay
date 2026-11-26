@@ -5,7 +5,6 @@ const express = require("express");
 const cors = require("cors");
 const db = require("./config/database");
 const authRoutes = require("./routes/authRoutes");
-console.log("AUTH ROUTE FILE:", require.resolve("./routes/authRoutes"));
 const otpRoutes = require("./routes/otpRoutes");
 
 const app = express();
@@ -50,9 +49,11 @@ app.use("/api/auth", authRoutes);
 // OTP verification routes
 app.use("/api/otp", otpRoutes);
 
-// Start server
-const PORT = process.env.PORT || 5000;
+if (require.main === module) {
+  const PORT = process.env.PORT || 5000;
+  app.listen(PORT, () => {
+    console.log(`WorkWay Backend running at http://localhost:${PORT}`);
+  });
+}
 
-app.listen(PORT, () => {
-  console.log(`WorkWay Backend running at http://localhost:${PORT}`);
-});
+module.exports = app;

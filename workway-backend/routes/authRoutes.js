@@ -3,13 +3,46 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
+const { OAuth2Client } = require("google-auth-library");
 
 const db = require("../config/database");
 const authMiddleware = require("../middleware/authMiddleware");
-const { sendVerificationOtp } = require("../config/emailService");
-const { loginLimiter } = require("../middleware/rateLimit");
+const { sendVerificationOtp, sendPasswordResetLink } = require("../config/emailService");
+const { loginLimiter, passwordResetLimiter } = require("../middleware/rateLimit");
 
 const router = express.Router();
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
+const createSession = async (connection, user, req) => {
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    throw new Error("JWT_SECRET is not configured with at least 32 characters.");
+  }
+
+  const token = jwt.sign(
+    { sub: String(user.id), role: user.role, sid: crypto.randomUUID() },
+    process.env.JWT_SECRET,
+    { expiresIn: "7d", issuer: "workway-api", audience: "workway-client" }
+  );
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await connection.execute(
+    `INSERT INTO user_sessions
+     (user_id, token_hash, device_name, ip_address, user_agent, expires_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      user.id,
+      tokenHash,
+      (req.get("x-device-name") || "").slice(0, 150) || null,
+      req.ip || null,
+      (req.get("user-agent") || "").slice(0, 500) || null,
+      expiresAt
+    ]
+  );
+
+  await connection.execute("UPDATE users SET last_login_at = NOW() WHERE id = ?", [user.id]);
+  return { token, expiresAt };
+};
 
 // ==========================================
 // POST: User Registration
@@ -233,55 +266,9 @@ router.post("/login", loginLimiter, async (req, res) => {
       });
     }
 
-    const sessionId = crypto.randomUUID();
-
-    const token = jwt.sign(
-      {
-        sub: String(user.id),
-        role: user.role,
-        sid: sessionId
-      },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: "7d",
-        issuer: "workway-api",
-        audience: "workway-client"
-      }
-    );
-
-    const tokenHash = crypto
-      .createHash("sha256")
-      .update(token)
-      .digest("hex");
-
-    const expiresAt = new Date(
-      Date.now() + 7 * 24 * 60 * 60 * 1000
-    );
-
     await connection.beginTransaction();
     transactionStarted = true;
-
-    await connection.execute(
-      `INSERT INTO user_sessions
-       (user_id, token_hash, device_name, ip_address,
-        user_agent, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [
-        user.id,
-        tokenHash,
-        (req.get("x-device-name") || "").slice(0, 150) || null,
-        req.ip || null,
-        (req.get("user-agent") || "").slice(0, 500) || null,
-        expiresAt
-      ]
-    );
-
-    await connection.execute(
-      `UPDATE users
-       SET last_login_at = NOW()
-       WHERE id = ?`,
-      [user.id]
-    );
+    const { token, expiresAt } = await createSession(connection, user, req);
 
     await connection.commit();
     transactionStarted = false;
@@ -316,6 +303,246 @@ router.post("/login", loginLimiter, async (req, res) => {
       message: "Login failed. Please try again."
     });
 
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+
+// ==========================================
+// POST: Request a password reset email
+// ==========================================
+router.post("/forgot-password", passwordResetLimiter, async (req, res) => {
+  const { email } = req.body || {};
+  if (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    return res.status(400).json({ success: false, message: "Please enter a valid email address." });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  let connection;
+  let resetTokenHash;
+
+  try {
+    connection = await db.getConnection();
+    const [users] = await connection.execute(
+      `SELECT id FROM users
+       WHERE email = ? AND account_status = 'ACTIVE'
+         AND email_verified_at IS NOT NULL AND deleted_at IS NULL
+       LIMIT 1`,
+      [normalizedEmail]
+    );
+
+    // Do not reveal whether an account exists.
+    if (users.length === 0) {
+      return res.status(200).json({ success: true, message: "If an eligible account exists, a password reset link has been sent." });
+    }
+
+    const rawToken = crypto.randomBytes(32).toString("base64url");
+    resetTokenHash = crypto.createHash("sha256").update(rawToken).digest("hex");
+    await connection.beginTransaction();
+    await connection.execute(
+      `UPDATE password_reset_tokens
+       SET used_at = NOW()
+       WHERE user_id = ? AND used_at IS NULL`,
+      [users[0].id]
+    );
+    await connection.execute(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 30 MINUTE))`,
+      [users[0].id, resetTokenHash]
+    );
+    await connection.commit();
+
+    const appUrl = process.env.APP_BASE_URL;
+    if (!appUrl) throw new Error("APP_BASE_URL is not configured.");
+    const resetUrl = new URL("/reset-password", appUrl);
+    resetUrl.searchParams.set("token", rawToken);
+    await sendPasswordResetLink(normalizedEmail, resetUrl.toString());
+
+    return res.status(200).json({ success: true, message: "If an eligible account exists, a password reset link has been sent." });
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (_) {
+        // The transaction may already have committed before email delivery failed.
+      }
+    }
+    if (resetTokenHash) {
+      try {
+        await db.execute(
+          "UPDATE password_reset_tokens SET used_at = NOW() WHERE token_hash = ? AND used_at IS NULL",
+          [resetTokenHash]
+        );
+      } catch (invalidateError) {
+        console.error("Reset token invalidation error:", invalidateError.message);
+      }
+    }
+    console.error("Password reset request error:", error.message);
+    return res.status(200).json({ success: true, message: "If an eligible account exists, a password reset link has been sent." });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ==========================================
+// POST: Complete a password reset
+// ==========================================
+router.post("/reset-password", passwordResetLimiter, async (req, res) => {
+  const { token, new_password } = req.body || {};
+  if (typeof token !== "string" || !/^[A-Za-z0-9_-]{40,50}$/.test(token) || typeof new_password !== "string") {
+    return res.status(400).json({ success: false, message: "A valid reset token and new password are required." });
+  }
+  if (new_password.length < 8 || Buffer.byteLength(new_password, "utf8") > 72) {
+    return res.status(400).json({ success: false, message: "Password must be at least 8 characters and no more than 72 UTF-8 bytes." });
+  }
+
+  let connection;
+  let transactionStarted = false;
+  try {
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const passwordHash = await bcrypt.hash(new_password, 12);
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    const [rows] = await connection.execute(
+      `SELECT prt.id, prt.user_id
+       FROM password_reset_tokens prt
+       INNER JOIN users u ON u.id = prt.user_id
+       WHERE prt.token_hash = ? AND prt.used_at IS NULL
+         AND prt.expires_at > NOW() AND u.account_status = 'ACTIVE'
+         AND u.deleted_at IS NULL
+       LIMIT 1 FOR UPDATE`,
+      [tokenHash]
+    );
+    if (rows.length === 0) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(400).json({ success: false, message: "Reset link is invalid or expired. Request a new one." });
+    }
+
+    const userId = rows[0].user_id;
+    await connection.execute("UPDATE users SET password_hash = ? WHERE id = ?", [passwordHash, userId]);
+    await connection.execute("UPDATE password_reset_tokens SET used_at = NOW() WHERE id = ?", [rows[0].id]);
+    await connection.execute("UPDATE user_sessions SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL", [userId]);
+    await connection.execute("UPDATE password_reset_tokens SET used_at = NOW() WHERE user_id = ? AND used_at IS NULL", [userId]);
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.status(200).json({ success: true, message: "Password reset successful. Please log in with your new password." });
+  } catch (error) {
+    if (connection && transactionStarted) {
+      try { await connection.rollback(); } catch (rollbackError) {
+        console.error("Password reset rollback error:", rollbackError.message);
+      }
+    }
+    console.error("Password reset error:", error.message);
+    return res.status(500).json({ success: false, message: "Unable to reset password. Please try again." });
+  } finally {
+    if (connection) connection.release();
+  }
+});
+
+// ==========================================
+// POST: Google Sign-In (Google Identity Services ID token)
+// ==========================================
+router.post("/google", loginLimiter, async (req, res) => {
+  const { credential } = req.body || {};
+  if (typeof credential !== "string" || !credential) {
+    return res.status(400).json({ success: false, message: "Google credential is required." });
+  }
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    return res.status(503).json({ success: false, message: "Google Sign-In is not configured." });
+  }
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    return res.status(503).json({ success: false, message: "Authentication is not configured." });
+  }
+
+  let connection;
+  let transactionStarted = false;
+  try {
+    let ticket;
+    try {
+      ticket = await googleClient.verifyIdToken({ idToken: credential, audience: process.env.GOOGLE_CLIENT_ID });
+    } catch (verificationError) {
+      const upstreamStatus = verificationError.response?.status || verificationError.status;
+      if (upstreamStatus >= 500 || ["ENOTFOUND", "ECONNRESET", "ETIMEDOUT", "EAI_AGAIN"].includes(verificationError.code)) {
+        console.error("Google token verification service error:", verificationError.message);
+        return res.status(503).json({ success: false, message: "Google Sign-In is temporarily unavailable. Please try again." });
+      }
+      return res.status(401).json({ success: false, message: "Google credential is invalid or expired." });
+    }
+    const payload = ticket.getPayload();
+    if (!payload?.sub || typeof payload.email !== "string" || payload.email.length > 190 || payload.email_verified !== true) {
+      return res.status(401).json({ success: false, message: "Google account email must be verified." });
+    }
+
+    const email = payload.email.trim().toLowerCase();
+    connection = await db.getConnection();
+    await connection.beginTransaction();
+    transactionStarted = true;
+
+    const [matches] = await connection.execute(
+      `SELECT id, full_name, email, mobile, role, account_status, google_subject
+       FROM users
+       WHERE google_subject = ? OR email = ?
+       LIMIT 1 FOR UPDATE`,
+      [payload.sub, email]
+    );
+
+    let user;
+    if (matches.length === 0) {
+      const googleName = typeof payload.name === "string" ? payload.name.trim() : "";
+      const fullName = (googleName || email.split("@")[0]).slice(0, 150);
+      const [insert] = await connection.execute(
+        `INSERT INTO users
+         (full_name, email, google_subject, role, account_status, email_verified_at)
+         VALUES (?, ?, ?, 'USER', 'ACTIVE', NOW())`,
+        [fullName, email, payload.sub]
+      );
+      user = { id: insert.insertId, full_name: fullName, email, mobile: null, role: "USER", account_status: "ACTIVE" };
+    } else {
+      user = matches[0];
+      if (user.email.toLowerCase() !== email || (user.google_subject && user.google_subject !== payload.sub)) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(409).json({ success: false, message: "This Google account cannot be linked to the existing account." });
+      }
+      if (["SUSPENDED", "DELETED"].includes(user.account_status)) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(403).json({ success: false, code: "ACCOUNT_SUSPENDED", message: "This account is not allowed to sign in." });
+      }
+      await connection.execute(
+        `UPDATE users SET google_subject = COALESCE(google_subject, ?),
+         email_verified_at = COALESCE(email_verified_at, NOW()),
+         account_status = CASE WHEN account_status = 'PENDING' THEN 'ACTIVE' ELSE account_status END
+         WHERE id = ?`,
+        [payload.sub, user.id]
+      );
+      user.account_status = "ACTIVE";
+    }
+
+    const { token, expiresAt } = await createSession(connection, user, req);
+    await connection.commit();
+    transactionStarted = false;
+
+    return res.status(200).json({
+      success: true,
+      message: "Google Sign-In successful.",
+      token,
+      expiresAt: expiresAt.toISOString(),
+      user: { id: user.id, full_name: user.full_name, email: user.email, mobile: user.mobile, role: user.role }
+    });
+  } catch (error) {
+    if (connection && transactionStarted) {
+      try { await connection.rollback(); } catch (rollbackError) {
+        console.error("Google sign-in rollback error:", rollbackError.message);
+      }
+    }
+    console.error("Google sign-in error:", error.message);
+    return res.status(500).json({ success: false, message: "Google Sign-In failed. Please try again." });
   } finally {
     if (connection) connection.release();
   }
