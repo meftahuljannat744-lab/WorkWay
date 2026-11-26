@@ -4,9 +4,12 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const db = require("./config/database");
+
 const authRoutes = require("./routes/authRoutes");
-console.log("AUTH ROUTE FILE:", require.resolve("./routes/authRoutes"));
 const otpRoutes = require("./routes/otpRoutes");
+const profileRoutes = require("./routes/profileRoutes");
+
+console.log("AUTH ROUTE FILE:", require.resolve("./routes/authRoutes"));
 
 const app = express();
 
@@ -49,6 +52,9 @@ app.use("/api/auth", authRoutes);
 
 // OTP verification routes
 app.use("/api/otp", otpRoutes);
+
+// User Profile routes
+app.use("/api", profileRoutes);
 
 // Start server
 const PORT = process.env.PORT || 5000;
