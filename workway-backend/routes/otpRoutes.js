@@ -208,7 +208,6 @@ router.post("/verify-email", otpLimiter, async (req, res) => {
 });
 
 
-
 // POST: Resend Email OTP
 router.post("/resend", otpLimiter, async (req, res) => {
   const { email } = req.body || {};
@@ -294,21 +293,22 @@ router.post("/resend", otpLimiter, async (req, res) => {
 
     await connection.commit();
     transactionStarted = false;
-try {
-  await sendVerificationOtp(normalizedEmail, otp);
-} catch (emailError) {
-  console.error("Resend OTP email error:", emailError.message);
 
-  return res.status(503).json({
-    success: false,
-    message: "OTP could not be sent to your email. Please try again."
-  });
-}
+    try {
+      await sendVerificationOtp(normalizedEmail, otp);
+    } catch (emailError) {
+      console.error("Resend OTP email error:", emailError.message);
 
-return res.status(200).json({
-  success: true,
-  message: "A new OTP has been sent to your email."
-});
+      return res.status(503).json({
+        success: false,
+        message: "OTP could not be sent to your email. Please try again."
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "A new OTP has been sent to your email."
+    });
 
   } catch (error) {
     if (connection && transactionStarted) {

@@ -1,7 +1,7 @@
 
 const { rateLimit } = require("express-rate-limit");
 
-// Login: প্রতি IP থেকে ১৫ মিনিটে সর্বোচ্চ ৫টি request
+// Login: 15 minutes, maximum 5 requests
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 5,
@@ -13,7 +13,7 @@ const loginLimiter = rateLimit({
   }
 });
 
-// OTP: 
+// OTP: 10 minutes, maximum 5 requests
 const otpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   limit: 5,
@@ -25,9 +25,10 @@ const otpLimiter = rateLimit({
   }
 });
 
+// Password reset: 15 minutes, maximum 10 requests
 const passwordResetLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 5,
+  limit: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: {
